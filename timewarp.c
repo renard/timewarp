@@ -107,6 +107,7 @@ License along with this program. If not, see
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <limits.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -188,9 +189,14 @@ static int parse_faketime(const char *s, time_t *out, char *errbuf, size_t errsz
         }
         while (*p) {
             char *end;
+            errno = 0;
             long  n = strtol(p, &end, 10);
             if (end == p) {
                 PFERR("timewarp: expected number in: %s", s);
+                return 0;
+            }
+            if (errno == ERANGE) {
+                PFERR("timewarp: number out of range in: %s", s);
                 return 0;
             }
             long mult;
@@ -203,6 +209,10 @@ static int parse_faketime(const char *s, time_t *out, char *errbuf, size_t errsz
             case '\0': mult = 1;       break;
             default:
                 PFERR("timewarp: unknown unit '%c' in: %s", *end, s);
+                return 0;
+            }
+            if (n > 0 && n > LONG_MAX / mult) {
+                PFERR("timewarp: offset overflow: %s", s);
                 return 0;
             }
             total += n * mult;
@@ -362,15 +372,18 @@ static void disable_vdso(pid_t pid)
 }
 
 
-// Write data directly into the tracee's address space
-static void write_to_child(pid_t pid, uint64_t remote_addr,
-                            const void *data, size_t len)
+// Write data directly into the tracee's address space; returns 0 or -1 (errno set)
+static int write_to_child(pid_t pid, uint64_t remote_addr,
+                           const void *data, size_t len)
 {
-    if (!remote_addr) return;
+    if (!remote_addr) return 0;
     struct iovec local  = { (void *)data,        len };
     struct iovec remote = { (void *)remote_addr, len };
-    if (process_vm_writev(pid, &local, 1, &remote, 1, 0) < 0)
+    if (process_vm_writev(pid, &local, 1, &remote, 1, 0) < 0) {
         perror("process_vm_writev");
+        return -1;
+    }
+    return 0;
 }
 
 
@@ -401,8 +414,22 @@ static void handle_time_notif(int notif_fd, long offset)
         if (clock_gettime(clockid, &ts) < 0) {
             resp.error = -errno;
         } else {
-            ts.tv_sec += offset;
-            write_to_child(req.pid, req.data.args[1], &ts, sizeof(ts));
+            /*
+             * Only shift wall-time clocks.  Monotonic/CPU clocks measure
+             * intervals; applying a wall-time offset to them breaks sleep(),
+             * poll() timeouts, pthread_cond_timedwait(), etc.
+             */
+            switch (clockid) {
+            case CLOCK_REALTIME:
+            case CLOCK_REALTIME_COARSE:
+            case CLOCK_TAI:
+                ts.tv_sec += offset;
+                break;
+            default:
+                break;
+            }
+            if (write_to_child(req.pid, req.data.args[1], &ts, sizeof(ts)) < 0)
+                resp.error = -errno;
         }
         break;
     }
@@ -415,14 +442,16 @@ static void handle_time_notif(int notif_fd, long offset)
             .tv_sec  = ts.tv_sec,
             .tv_usec = ts.tv_nsec / 1000,
         };
-        write_to_child(req.pid, req.data.args[0], &tv, sizeof(tv));
+        if (write_to_child(req.pid, req.data.args[0], &tv, sizeof(tv)) < 0)
+            resp.error = -errno;
         break;
     }
 
     case __NR_time: {
         time_t now = time(NULL) + offset;
         resp.val   = (int64_t)now;
-        write_to_child(req.pid, req.data.args[0], &now, sizeof(now));
+        if (write_to_child(req.pid, req.data.args[0], &now, sizeof(now)) < 0)
+            resp.error = -errno;
         break;
     }
 
@@ -467,13 +496,11 @@ static void handle_ctl_conn(int ctl_sock, long *offset)
     time_t new_epoch;
     if (!parse_faketime(buf, &new_epoch, errbuf, sizeof(errbuf))) {
         char resp[300];
-        int len = snprintf(resp, sizeof(resp), "ERROR: timewarp %s\n", errbuf);
-        write(client, resp, len);
+        int len = snprintf(resp, sizeof(resp), "ERROR: %s\n", errbuf);
+        if (write(client, resp, len) < 0) perror("write(control error)");
     } else {
         *offset = (long)new_epoch - (long)time(NULL);
-        char resp[64];
-        int len = snprintf(resp, sizeof(resp), "OK\n");
-        write(client, resp, len);
+        if (write(client, "OK\n", 3) < 0) perror("write(control ok)");
     }
 
 done:
@@ -519,7 +546,11 @@ static int supervision_loop(int notif_fd, int sfd, int ctl_sock,
         if (pfds[0].revents & POLLIN)
             handle_time_notif(notif_fd, offset);
 
-        /* POLLHUP: all processes using the seccomp filter have exited */
+        /*
+         * POLLHUP: all tracees have exited.  The guard !(... POLLIN) lets
+         * us drain the last notification when both bits fire together;
+         * the next poll() iteration returns POLLHUP alone and we break.
+         */
         if ((pfds[0].revents & POLLHUP) && !(pfds[0].revents & POLLIN))
             break;
 
@@ -667,9 +698,14 @@ int main(int argc, char *argv[])
     int sfd = signalfd(-1, &chldset, SFD_CLOEXEC | SFD_NONBLOCK);
     if (sfd < 0) { perror("signalfd"); return 1; }
 
+    /* Declare cleanup-tracked resources early so goto cleanup is always safe */
+    int      ctl_sock = -1;
+    int      notif_fd = -1;
+    int      sv[2]    = { -1, -1 };
+
     /* Parse the fake time and compute the signed offset from now */
     time_t fake_epoch;
-    if (!parse_faketime(argv[1], &fake_epoch, NULL, 0)) return 1;
+    if (!parse_faketime(argv[1], &fake_epoch, NULL, 0)) goto cleanup;
     long offset = (long)fake_epoch - (long)time(NULL);
 
     /*
@@ -677,10 +713,9 @@ int main(int argc, char *argv[])
      * holds the only reference.  SOCK_CLOEXEC ensures the child does not
      * inherit it across exec.
      */
-    int ctl_sock = -1;
     if (ctl_path) {
         ctl_sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-        if (ctl_sock < 0) { perror("socket(control)"); return 1; }
+        if (ctl_sock < 0) { perror("socket(control)"); goto cleanup; }
 
         struct sockaddr_un addr;
         memset(&addr, 0, sizeof(addr));
@@ -691,10 +726,10 @@ int main(int argc, char *argv[])
         unlink(ctl_path);
 
         if (bind(ctl_sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-            perror("bind(control)"); return 1;
+            perror("bind(control)"); goto cleanup;
         }
         if (listen(ctl_sock, 8) < 0) {
-            perror("listen(control)"); return 1;
+            perror("listen(control)"); goto cleanup;
         }
     }
 
@@ -702,14 +737,13 @@ int main(int argc, char *argv[])
      * Socketpair to transfer the seccomp notification fd from child to
      * parent via SCM_RIGHTS before execvp() replaces the child's image.
      */
-    int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) < 0) {
         perror("socketpair");
-        return 1;
+        goto cleanup;
     }
 
     pid_t child = fork();
-    if (child < 0) { perror("fork"); return 1; }
+    if (child < 0) { perror("fork"); goto cleanup; }
 
     if (child == 0) {
         // CHILD SIDE
@@ -726,14 +760,14 @@ int main(int argc, char *argv[])
         }
         raise(SIGSTOP);
 
-        int notif_fd = install_seccomp_filter();
-        if (notif_fd < 0) _exit(1);
+        int nfd = install_seccomp_filter();
+        if (nfd < 0) _exit(1);
 
-        if (send_fd(sv[1], notif_fd) < 0) {
+        if (send_fd(sv[1], nfd) < 0) {
             perror("send_fd(notif_fd)");
             _exit(1);
         }
-        close(notif_fd);
+        close(nfd);
         close(sv[1]);
 
         execvp(argv[cmd_idx], argv + cmd_idx);
@@ -742,33 +776,33 @@ int main(int argc, char *argv[])
     }
 
      // PARENT SIDE
-    close(sv[1]);
+    close(sv[1]); sv[1] = -1;
 
     int wstatus;
-    if (waitpid(child, &wstatus, 0) < 0) { perror("waitpid"); return 1; }
+    if (waitpid(child, &wstatus, 0) < 0) { perror("waitpid"); goto cleanup; }
     if (!WIFSTOPPED(wstatus)) {
         fprintf(stderr, "timewarp: unexpected initial child state\n");
-        return 1;
+        goto cleanup;
     }
 
     if (ptrace(PTRACE_SETOPTIONS, child, NULL,
                (void *)(unsigned long)PTRACE_O_TRACEEXEC) < 0) {
         perror("ptrace(PTRACE_SETOPTIONS)");
-        return 1;
+        goto cleanup;
     }
     if (ptrace(PTRACE_CONT, child, NULL, NULL) < 0) {
         perror("ptrace(PTRACE_CONT)");
-        return 1;
+        goto cleanup;
     }
 
-    int notif_fd = recv_fd(sv[0]);
+    notif_fd = recv_fd(sv[0]);
     if (notif_fd < 0) {
         fprintf(stderr, "timewarp: failed to receive notification fd\n");
-        return 1;
+        goto cleanup;
     }
-    close(sv[0]);
+    close(sv[0]); sv[0] = -1;
 
-    if (waitpid(child, &wstatus, 0) < 0) { perror("waitpid"); return 1; }
+    if (waitpid(child, &wstatus, 0) < 0) { perror("waitpid"); goto cleanup; }
     if (WIFSTOPPED(wstatus) &&
         (wstatus >> 8) == (SIGTRAP | (PTRACE_EVENT_EXEC << 8))) {
         disable_vdso(child);
@@ -777,22 +811,34 @@ int main(int argc, char *argv[])
     /* Upgrade to full tree-tracking options, then resume under ptrace */
     if (ptrace(PTRACE_SETOPTIONS, child, NULL, (void *)PTRACE_TREE_OPTS) < 0) {
         perror("ptrace(PTRACE_SETOPTIONS tree)");
-        return 1;
+        goto cleanup;
     }
     if (ptrace(PTRACE_CONT, child, NULL, NULL) < 0) {
         perror("ptrace(PTRACE_CONT)");
-        return 1;
+        goto cleanup;
     }
 
     int final_wstatus = supervision_loop(notif_fd, sfd, ctl_sock, offset, child);
-    close(notif_fd);
-    close(sfd);
+    close(notif_fd); notif_fd = -1;
+    close(sfd);      sfd = -1;
     if (ctl_sock >= 0) {
-        close(ctl_sock);
-        unlink(ctl_path);   /* clean up the socket file */
+        close(ctl_sock); ctl_sock = -1;
+        unlink(ctl_path);
+        ctl_path = NULL;
     }
 
     if (WIFEXITED(final_wstatus))   return WEXITSTATUS(final_wstatus);
     if (WIFSIGNALED(final_wstatus)) return 128 + WTERMSIG(final_wstatus);
+    return 1;
+
+cleanup:
+    if (sfd >= 0)      close(sfd);
+    if (sv[0] >= 0)    close(sv[0]);
+    if (sv[1] >= 0)    close(sv[1]);
+    if (notif_fd >= 0) close(notif_fd);
+    if (ctl_sock >= 0) {
+        close(ctl_sock);
+        if (ctl_path) unlink(ctl_path);
+    }
     return 1;
 }
