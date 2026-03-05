@@ -57,10 +57,15 @@ The C runtime (glibc, musl) discovers the vDSO at startup by reading
 this entry is zero the runtime falls back to regular syscalls for all time
 functions.
 
-`timewarp` uses `ptrace` to zero `AT_SYSINFO_EHDR` in the child's `auxv` at
-the **exec-stop** — the instant after `execve` succeeds but before the new
+`timewarp` zeros `AT_SYSINFO_EHDR` in the child's `auxv` at the
+**exec-stop** — the instant after `execve` succeeds but before the new
 program has executed a single instruction.  The C runtime then initialises
 without the vDSO, and every subsequent time call becomes a real syscall.
+
+To locate the entry efficiently, `timewarp` reads the initial stack in a
+single `process_vm_readv` call (covering `argc`, `argv`, `envp` and `auxv`
+in one shot) and zeros the value with `process_vm_writev`.  For unusually
+large environments it falls back to word-by-word `PTRACE_PEEKDATA`.
 
 ### 2. Intercepting time syscalls (via seccomp user notification)
 
@@ -69,22 +74,55 @@ intercept specific syscalls made by a child and respond to them from user
 space, without `ptrace` overhead.
 
 Before calling `execvp`, the child installs a BPF filter that redirects
-`clock_gettime`, `gettimeofday` and `time` to a notification queue.  The
-resulting file descriptor is handed to the parent via a Unix socket
-(`SCM_RIGHTS`) before `exec` replaces the child's address space.  The
-filter is **inherited across `fork()` and `exec()`**, so all descendants
-are automatically covered.
+`clock_gettime`, `gettimeofday`, `time`, `clock_nanosleep` and
+`timerfd_settime` to a notification queue.  The resulting file descriptor
+is handed to the parent via a Unix socket (`SCM_RIGHTS`) before `exec`
+replaces the child's address space.  The filter is **inherited across
+`fork()` and `exec()`**, so all descendants are automatically covered.
 
-In the supervisor loop the parent:
+Two interception strategies are used depending on the syscall:
 
-1. Waits for a notification with `SECCOMP_IOCTL_NOTIF_RECV`.
-2. Reads the real time, adds the configured offset.
-3. Writes the faked `struct timespec` / `struct timeval` / `time_t`
+**Read-only time queries** (`clock_gettime`, `gettimeofday`, `time`):
+
+1. The supervisor waits for a notification with `SECCOMP_IOCTL_NOTIF_RECV`.
+2. It reads the real time and adds the configured offset.
+3. It writes the faked `struct timespec` / `struct timeval` / `time_t`
    directly into the child's memory with `process_vm_writev`.
-4. Unblocks the child thread with `SECCOMP_IOCTL_NOTIF_SEND`.
+4. It unblocks the child with a synthetic success response via
+   `SECCOMP_IOCTL_NOTIF_SEND`.
 
 The child thread is blocked for the entire duration and receives the faked
-value as the return of its own syscall — transparent to the application.
+value as if it were the normal syscall return.
+
+Only `CLOCK_REALTIME`, `CLOCK_REALTIME_COARSE` and `CLOCK_TAI` are
+shifted.  `CLOCK_MONOTONIC` and other interval-measurement clocks are
+passed through unmodified — shifting them would break `sleep()`, `poll()`
+timeouts, `pthread_cond_timedwait()` and similar primitives.
+
+**Absolute-time operations** (`clock_nanosleep TIMER_ABSTIME`,
+`timerfd_settime TFD_TIMER_ABSTIME`):
+
+A program may compute an absolute deadline from the faked clock and then
+sleep until that moment:
+
+```c
+clock_gettime(CLOCK_REALTIME, &deadline);  // returns faked time
+deadline.tv_sec += 5;
+clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &deadline, NULL);
+// without interception: kernel sleeps until this time in REAL time
+// → returns immediately if faked time is in the past, or sleeps too long
+```
+
+The supervisor intercepts these calls, subtracts the offset from the
+absolute deadline in the tracee's memory (`real_deadline = faked_deadline
+− offset`), then resumes the syscall via `SECCOMP_USER_NOTIF_FLAG_CONTINUE`
+so the kernel executes it with the corrected value.  Relative operations
+and non-wall clocks pass through unchanged.
+
+For `timerfd_settime`, the clock type of the fd is determined at intercept
+time by reading `/proc/<pid>/fdinfo/<fd>`, which handles `dup`/`fork`/
+`SCM_RIGHTS` correctly without any per-fd tracking.  The periodic
+`it_interval` is always relative and requires no adjustment.
 
 ### 3. Process-tree tracking (via PTRACE_O_TRACEFORK)
 
@@ -231,6 +269,11 @@ Requires: gcc, Linux kernel headers ≥ 5.0, glibc.
   Threads share the parent's address space so the vDSO is already disabled
   for them; this limitation only affects exotic process-creation patterns
   that do not use `fork()` or `vfork()`.
+- **`timerfd_gettime` not intercepted** — `timerfd_gettime()` returns the
+  remaining time until expiry in real-time terms.  Programs that use this
+  return value to infer elapsed faked time may get confusing results.
+  Similarly, the `old_value` output of `timerfd_settime()` reflects the
+  previous timer in real time, not faked time.
 - **No clock drift / speed factor** — the offset is constant; the clock
   advances at real speed.  libfaketime's `-f` and speed-factor features are
   not implemented.

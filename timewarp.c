@@ -54,19 +54,37 @@ License along with this program. If not, see
  *
  *   2. seccomp BPF filter with SECCOMP_RET_USER_NOTIF (Linux >= 5.0)
  *      The child installs a filter that redirects clock_gettime,
- *      gettimeofday and time(2) to a user-space supervisor instead of
- *      executing them normally.  The resulting notification fd is passed
- *      to the parent via a Unix socket (SCM_RIGHTS) before execvp().
- *      The filter is inherited across fork() and exec(), so all processes
- *      in the tree are automatically covered.
+ *      gettimeofday, time(2), clock_nanosleep and timerfd_settime to a
+ *      user-space supervisor.  The notification fd is handed to the parent
+ *      via SCM_RIGHTS before execvp() replaces the child's image.  The
+ *      filter is inherited across fork() and exec(), covering the whole
+ *      process tree automatically.
+ *
+ *      Two interception strategies are used:
+ *
+ *      a) Read-only time calls (clock_gettime, gettimeofday, time):
+ *         The supervisor computes real_time + offset, writes the result
+ *         into the tracee's output buffer via process_vm_writev, and
+ *         sends a synthetic success response.  The tracee never executes
+ *         the real syscall.
+ *
+ *      b) Absolute-deadline operations (clock_nanosleep TIMER_ABSTIME,
+ *         timerfd_settime TFD_TIMER_ABSTIME) on wall-time clocks:
+ *         The supervisor adjusts the deadline in the tracee's memory
+ *         (real_deadline = faked_deadline - offset) then resumes the
+ *         syscall via SECCOMP_USER_NOTIF_FLAG_CONTINUE so the kernel
+ *         executes it with the corrected value.  Relative operations and
+ *         non-wall clocks (CLOCK_MONOTONIC, etc.) pass through unchanged.
  *
  *   3. Zeroing AT_SYSINFO_EHDR via ptrace at every exec-stop
  *      The kernel sets AT_SYSINFO_EHDR in the process's auxiliary vector
  *      (auxv) to tell glibc/musl where the vDSO is mapped.  If this entry
  *      is 0 when the C runtime initialises, it skips the vDSO and falls
- *      back to real syscalls for all time functions.  We patch it with
- *      PTRACE_POKEDATA at the ptrace exec-stop, which fires after execve
- *      succeeds but before a single instruction of the new program runs.
+ *      back to real syscalls for all time functions.  We locate it with a
+ *      single process_vm_readv over the initial stack (falling back to
+ *      word-by-word PTRACE_PEEKDATA for unusually large environments) and
+ *      zero it with process_vm_writev at the ptrace exec-stop, which fires
+ *      after execve succeeds but before a single instruction runs.
  *      IMPORTANT: the kernel writes a fresh auxv for every execve(), so
  *      we must patch it at EACH exec-stop, not only the first one.
  *
@@ -103,6 +121,7 @@ License along with this program. If not, see
 #define _GNU_SOURCE
 #include <errno.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -113,14 +132,16 @@ License along with this program. If not, see
 #include <unistd.h>
 
 #include <elf.h>           /* AT_NULL, AT_SYSINFO_EHDR                */
+#include <fcntl.h>         /* open, O_RDONLY                          */
 #include <sys/ioctl.h>
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/signalfd.h>  /* signalfd, struct signalfd_siginfo        */
 #include <sys/socket.h>
 #include <sys/syscall.h>
+#include <sys/timerfd.h>   /* TFD_TIMER_ABSTIME                       */
 #include <sys/types.h>
-#include <sys/uio.h>       /* process_vm_writev                       */
+#include <sys/uio.h>       /* process_vm_readv, process_vm_writev     */
 #include <sys/user.h>      /* struct user_regs_struct                 */
 #include <sys/un.h>        /* struct sockaddr_un                      */
 #include <sys/wait.h>
@@ -297,9 +318,11 @@ static int install_seccomp_filter(void)
     struct sock_filter filter[] = {
         BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
                  (uint32_t)offsetof(struct seccomp_data, nr)),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_clock_gettime, 3, 0),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_gettimeofday,  2, 0),
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_time,          1, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_clock_gettime,   5, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_gettimeofday,    4, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_time,            3, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_clock_nanosleep, 2, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_timerfd_settime, 1, 0),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_USER_NOTIF),
     };
@@ -330,6 +353,11 @@ static int install_seccomp_filter(void)
  * Must be called at EVERY exec-stop across the whole process tree:
  * the kernel re-populates AT_SYSINFO_EHDR in the fresh auxv of each
  * new execve(), re-enabling the vDSO for that image.
+ *
+ * Fast path: process_vm_readv reads the entire argc/argv/envp/auxv
+ * region in a single call (vs. one PTRACE_PEEKDATA per word).  8 KB
+ * handles up to ~1000 argv+envp pointers.  Unusual environments fall
+ * back to the original word-by-word ptrace scan.
  */
 static void disable_vdso(pid_t pid)
 {
@@ -339,9 +367,46 @@ static void disable_vdso(pid_t pid)
         return;
     }
 
-    unsigned long sp  = (unsigned long)regs.rsp;
-    unsigned long ptr;
+    unsigned long sp = (unsigned long)regs.rsp;
 
+    /* --- Fast path -------------------------------------------------- */
+    uint8_t buf[8192];
+    {
+        struct iovec lv = { buf, sizeof(buf) };
+        struct iovec rv = { (void *)sp, sizeof(buf) };
+        ssize_t n = process_vm_readv(pid, &lv, 1, &rv, 1, 0);
+        if (n >= (ssize_t)(2 * sizeof(long))) {
+            long   argc = *(long *)buf;
+            size_t off  = (size_t)(1 + argc + 1) * sizeof(long);
+
+            /* Skip envp[] until NULL terminator */
+            while (off + sizeof(long) <= (size_t)n) {
+                long v = *(long *)(buf + off);
+                off += sizeof(long);
+                if (v == 0) break;
+            }
+
+            /* Scan auxv[] for AT_SYSINFO_EHDR */
+            while (off + 2 * sizeof(long) <= (size_t)n) {
+                long type = *(long *)(buf + off);
+                if (type == AT_NULL) return;
+                if (type == AT_SYSINFO_EHDR) {
+                    unsigned long val_addr = sp + off + sizeof(long);
+                    long zero = 0L;
+                    struct iovec zlv = { &zero, sizeof(zero) };
+                    struct iovec zrv = { (void *)val_addr, sizeof(zero) };
+                    if (process_vm_writev(pid, &zlv, 1, &zrv, 1, 0) < 0)
+                        perror("process_vm_writev(AT_SYSINFO_EHDR)");
+                    return;
+                }
+                off += 2 * sizeof(long);
+            }
+            return;  /* AT_SYSINFO_EHDR absent — no vDSO */
+        }
+    }
+
+    /* --- Fallback: word-by-word ptrace (large env or vm_readv failed) --- */
+    unsigned long ptr;
     errno = 0;
     long argc = ptrace(PTRACE_PEEKDATA, pid, (void *)sp, NULL);
     if (errno) { perror("ptrace(PEEKDATA) argc"); return; }
@@ -372,6 +437,20 @@ static void disable_vdso(pid_t pid)
 }
 
 
+// Read data from the tracee's address space; returns 0 or -1 (errno set)
+static int read_from_child(pid_t pid, uint64_t remote_addr,
+                            void *data, size_t len)
+{
+    if (!remote_addr) return -1;
+    struct iovec local  = { data,                len };
+    struct iovec remote = { (void *)remote_addr, len };
+    if (process_vm_readv(pid, &local, 1, &remote, 1, 0) < 0) {
+        perror("process_vm_readv");
+        return -1;
+    }
+    return 0;
+}
+
 // Write data directly into the tracee's address space; returns 0 or -1 (errno set)
 static int write_to_child(pid_t pid, uint64_t remote_addr,
                            const void *data, size_t len)
@@ -386,6 +465,30 @@ static int write_to_child(pid_t pid, uint64_t remote_addr,
     return 0;
 }
 
+
+/*
+ * Return the clockid that timerfd fd was created with, by reading
+ * /proc/<pid>/fdinfo/<fd>.  Returns -1 on error.
+ * This avoids having to track fd→clockid across fork/dup/SCM_RIGHTS.
+ */
+static int get_timerfd_clockid(pid_t pid, int fd)
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/fdinfo/%d", pid, fd);
+    int f = open(path, O_RDONLY | O_CLOEXEC);
+    if (f < 0) return -1;
+
+    char buf[512];
+    ssize_t n = read(f, buf, sizeof(buf) - 1);
+    close(f);
+    if (n <= 0) return -1;
+    buf[n] = '\0';
+
+    int clockid = -1;
+    char *p = strstr(buf, "clockid:");
+    if (p) sscanf(p, "clockid: %d", &clockid);
+    return clockid;
+}
 
 // Handle one intercepted time syscall notification
 static void handle_time_notif(int notif_fd, long offset)
@@ -455,6 +558,79 @@ static void handle_time_notif(int notif_fd, long offset)
         break;
     }
 
+    case __NR_clock_nanosleep: {
+        clockid_t clockid = (clockid_t)(int32_t)req.data.args[0];
+        int       flags   = (int)req.data.args[1];
+
+        /*
+         * Relative sleeps (flags == 0) and non-wall clocks are correct
+         * as-is.  Only absolute wall-time deadlines need adjustment:
+         * the tracee computed the deadline from the faked clock, so we
+         * subtract offset before handing the call back to the kernel.
+         * For TIMER_ABSTIME the kernel ignores the remain argument, so
+         * no output fixup is needed.
+         */
+        if (!(flags & TIMER_ABSTIME) ||
+            (clockid != CLOCK_REALTIME &&
+             clockid != CLOCK_REALTIME_COARSE &&
+             clockid != CLOCK_TAI)) {
+            resp.flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+            break;
+        }
+
+        struct timespec ts;
+        if (read_from_child(req.pid, req.data.args[2], &ts, sizeof(ts)) < 0) {
+            resp.error = -errno;
+            break;
+        }
+        ts.tv_sec -= offset;
+        if (write_to_child(req.pid, req.data.args[2], &ts, sizeof(ts)) < 0) {
+            resp.error = -errno;
+            break;
+        }
+        resp.flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+        break;
+    }
+
+    case __NR_timerfd_settime: {
+        int fd    = (int)req.data.args[0];
+        int flags = (int)req.data.args[1];
+
+        /*
+         * Only absolute expirations on wall-time clocks need adjustment.
+         * We query /proc/<pid>/fdinfo/<fd> to determine the clock the fd
+         * was created with — this handles dup/fork/SCM_RIGHTS correctly.
+         * Note: timerfd_gettime() is not intercepted; old_value (args[3])
+         * is left in real-time terms, which is an accepted limitation.
+         */
+        if (!(flags & TFD_TIMER_ABSTIME)) {
+            resp.flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+            break;
+        }
+
+        int clockid = get_timerfd_clockid(req.pid, fd);
+        if (clockid != CLOCK_REALTIME &&
+            clockid != CLOCK_REALTIME_COARSE &&
+            clockid != CLOCK_TAI) {
+            resp.flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+            break;
+        }
+
+        struct itimerspec its;
+        if (read_from_child(req.pid, req.data.args[2], &its, sizeof(its)) < 0) {
+            resp.error = -errno;
+            break;
+        }
+        its.it_value.tv_sec -= offset;   /* absolute expiry → shift */
+        /* it_interval is relative → no adjustment */
+        if (write_to_child(req.pid, req.data.args[2], &its, sizeof(its)) < 0) {
+            resp.error = -errno;
+            break;
+        }
+        resp.flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+        break;
+    }
+
     default:
         resp.flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
         break;
@@ -474,7 +650,7 @@ send:
  * with "OK\n" or "ERROR: <message>\n".
  */
 
-static void handle_ctl_conn(int ctl_sock, long *offset)
+static void handle_ctl_conn(int ctl_sock, _Atomic long *offset)
 {
     int client = accept4(ctl_sock, NULL, NULL, SOCK_CLOEXEC);
     if (client < 0) return;
@@ -499,7 +675,8 @@ static void handle_ctl_conn(int ctl_sock, long *offset)
         int len = snprintf(resp, sizeof(resp), "ERROR: %s\n", errbuf);
         if (write(client, resp, len) < 0) perror("write(control error)");
     } else {
-        *offset = (long)new_epoch - (long)time(NULL);
+        atomic_store_explicit(offset, (long)new_epoch - (long)time(NULL),
+                              memory_order_relaxed);
         if (write(client, "OK\n", 3) < 0) perror("write(control ok)");
     }
 
@@ -521,8 +698,16 @@ done:
  * Returns the root child's waitpid status.
  */
 static int supervision_loop(int notif_fd, int sfd, int ctl_sock,
-                             long offset, pid_t root)
+                             long init_offset, pid_t root)
 {
+    /*
+     * _Atomic so handle_ctl_conn() and handle_time_notif() can safely
+     * share the value if threading is ever added.  memory_order_relaxed
+     * is sufficient: there is no ordering dependency between the write
+     * and subsequent time-syscall intercepts.
+     */
+    _Atomic long offset;
+    atomic_init(&offset, init_offset);
     int root_wstatus = 0;
     int root_exited  = 0;
 
@@ -544,7 +729,8 @@ static int supervision_loop(int notif_fd, int sfd, int ctl_sock,
 
         /* Serve one intercepted time syscall */
         if (pfds[0].revents & POLLIN)
-            handle_time_notif(notif_fd, offset);
+            handle_time_notif(notif_fd,
+                              atomic_load_explicit(&offset, memory_order_relaxed));
 
         /*
          * POLLHUP: all tracees have exited.  The guard !(... POLLIN) lets
